@@ -6,6 +6,7 @@
 
   const { CLAVES, detectClaves, normalize } = window.Claves;
   const MAX_SLOTS = 8;
+  const MIC_OPTIONS = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
   const $ = (s) => document.querySelector(s);
   const ROLE_CODES = Object.keys(CLAVES).filter((k) => CLAVES[k][1] === "role");
 
@@ -37,6 +38,10 @@
     talking: false,
     wake: null,
     audioCtx: null,
+    silent: null, // flujo de audio mudo: va en la llamada mientras el micrófono está libre
+    micTrack: null,
+    micBusy: false,
+    releaseMode: true, // true = el micrófono solo se usa mientras hablas
     timers: [],
     alertTimer: null,
     inRoom: false,
@@ -66,6 +71,96 @@
     $("#joinMsg").textContent = text || "";
   }
 
+  // ---------- Micrófono: se usa solo mientras hablas ----------
+  // En la llamada va un audio mudo. Al presionar el botón se abre el micrófono real y se
+  // cambia esa pista; al soltar se cambia de vuelta y se suelta el micrófono, así otras
+  // apps (llamadas, notas de voz) pueden usarlo.
+  function makeSilent() {
+    if (state.silent || !state.audioCtx) return state.silent;
+    try {
+      if (state.audioCtx.createMediaStreamDestination) {
+        state.silent = state.audioCtx.createMediaStreamDestination().stream;
+      }
+    } catch (e) {
+      state.silent = null;
+    }
+    return state.silent;
+  }
+  const useRelease = () => state.releaseMode && !!state.silent;
+  const outStream = () => state.stream || state.silent;
+
+  // Pone `track` como la pista de audio que se envía en todas las llamadas
+  function swapTrack(track) {
+    if (!track) return;
+    peers.forEach((e) => {
+      const pc = e.call && e.call.peerConnection;
+      if (!pc || !pc.getSenders) return;
+      pc.getSenders().forEach((s) => {
+        if (s.track && s.track.kind === "audio" && s.track !== track) {
+          try {
+            s.replaceTrack(track);
+          } catch (_) {}
+        }
+      });
+    });
+  }
+  const silentTrack = () => (state.silent && state.silent.getAudioTracks()[0]) || null;
+
+  async function acquireMic() {
+    if (state.micBusy) return;
+    if (state.micTrack && state.micTrack.readyState === "live") {
+      state.micTrack.enabled = true;
+      swapTrack(state.micTrack);
+      return;
+    }
+    state.micBusy = true;
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ audio: MIC_OPTIONS });
+      if (!state.inRoom || !state.talking) {
+        // ya soltaste el botón antes de que abriera
+        s.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      state.stream = s;
+      state.micTrack = s.getAudioTracks()[0] || null;
+      if (state.micTrack) {
+        state.micTrack.enabled = true;
+        swapTrack(state.micTrack);
+      }
+    } catch (e) {
+      note("No pude abrir el micrófono. ¿Otra app lo está usando?");
+    } finally {
+      state.micBusy = false;
+    }
+  }
+
+  function releaseMic() {
+    swapTrack(silentTrack());
+    if (state.stream) state.stream.getTracks().forEach((t) => t.stop());
+    state.stream = null;
+    state.micTrack = null;
+  }
+
+  // Cuando el usuario cambia la opción con la sala abierta
+  async function applyMicMode() {
+    state.releaseMode = $("#optRelease").checked;
+    if (!state.inRoom) return;
+    if (useRelease()) {
+      if (!state.talking) releaseMic();
+    } else if (!state.stream) {
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({ audio: MIC_OPTIONS });
+        if (!state.inRoom) return s.getTracks().forEach((t) => t.stop());
+        state.stream = s;
+        state.micTrack = s.getAudioTracks()[0] || null;
+        s.getAudioTracks().forEach((t) => (t.enabled = state.talking));
+        swapTrack(state.micTrack);
+      } catch (e) {
+        note("No pude abrir el micrófono.");
+      }
+    }
+  }
+
   // ---------- Pantalla de entrada ----------
   function buildRoleSelect() {
     const sel = $("#role");
@@ -92,16 +187,38 @@
 
     const btn = $("#enter");
     btn.disabled = true;
+
+    // El audio se crea aquí, mientras el toque del botón todavía cuenta
     try {
-      state.stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
+      if (state.audioCtx) state.audioCtx.close();
+    } catch (e) {}
+    state.audioCtx = null;
+    state.silent = null;
+    try {
+      state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch (e) {}
+
+    let first;
+    try {
+      first = await navigator.mediaDevices.getUserMedia({ audio: MIC_OPTIONS });
     } catch (e) {
       btn.disabled = false;
       return joinMsg("Necesito permiso del micrófono para entrar.");
     }
     btn.disabled = false;
-    state.stream.getAudioTracks().forEach((t) => (t.enabled = false)); // en silencio hasta presionar
+
+    state.releaseMode = $("#optRelease").checked;
+    makeSilent();
+    if (useRelease()) {
+      // Solo se pedía el permiso: se suelta el micrófono para que otras apps lo puedan usar
+      first.getTracks().forEach((t) => t.stop());
+      state.stream = null;
+      state.micTrack = null;
+    } else {
+      state.stream = first;
+      state.micTrack = first.getAudioTracks()[0] || null;
+      first.getAudioTracks().forEach((t) => (t.enabled = false)); // en silencio hasta presionar
+    }
 
     state.name = name;
     state.room = room;
@@ -109,10 +226,6 @@
     store.set("name", name);
     store.set("room", room);
     store.set("role", state.role);
-
-    try {
-      state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    } catch (e) {}
 
     $("#join").classList.add("hidden");
     $("#app").classList.remove("hidden");
@@ -151,7 +264,7 @@
     p.on("connection", (conn) => wireData(conn, false));
     p.on("call", (call) => {
       wireCall(call); // primero escuchar eventos, luego contestar
-      call.answer(state.stream);
+      call.answer(outStream());
     });
 
     p.on("error", (err) => {
@@ -233,8 +346,9 @@
   }
 
   function placeCall(id) {
-    if (!state.peer || !state.stream) return;
-    const call = state.peer.call(id, state.stream);
+    const out = outStream();
+    if (!state.peer || !out) return;
+    const call = state.peer.call(id, out);
     if (call) wireCall(call);
   }
 
@@ -433,9 +547,14 @@
 
   // ---------- Hablar (push-to-talk) ----------
   function setTalking(on) {
-    if (on === state.talking || !state.stream) return;
+    if (on === state.talking || !state.inRoom) return;
     state.talking = on;
-    state.stream.getAudioTracks().forEach((t) => (t.enabled = on));
+    if (useRelease()) {
+      if (on) acquireMic();
+      else releaseMic();
+    } else if (state.stream) {
+      state.stream.getAudioTracks().forEach((t) => (t.enabled = on));
+    }
     broadcast({ t: "ptt", on });
     const btn = $("#ptt");
     btn.classList.toggle("on", on);
@@ -631,6 +750,9 @@
     state.peer = null;
     if (state.stream) state.stream.getTracks().forEach((t) => t.stop());
     state.stream = null;
+    state.micTrack = null;
+    if (state.silent) state.silent.getTracks().forEach((t) => t.stop());
+    state.silent = null;
     try {
       state.wake && state.wake.release();
     } catch (_) {}
@@ -668,6 +790,11 @@
     $("#optTranscribe").addEventListener("change", (e) =>
       store.set("transcribe", e.target.checked ? "1" : "0")
     );
+    $("#optRelease").checked = store.get("release", "1") === "1";
+    $("#optRelease").addEventListener("change", (e) => {
+      store.set("release", e.target.checked ? "1" : "0");
+      applyMicMode();
+    });
 
     const ptt = $("#ptt");
     ptt.addEventListener("pointerdown", (e) => {
@@ -693,7 +820,9 @@
     });
 
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible" && state.inRoom) keepAwake();
+      if (!state.inRoom) return;
+      if (document.visibilityState === "visible") keepAwake();
+      else if (state.talking) setTalking(false); // al salir de la app se suelta el micrófono
     });
 
     if ("serviceWorker" in navigator) {

@@ -24,6 +24,8 @@ public class RadioService extends Service {
     public static final String CH_ALERT = "alertas_claves";
     private static final int ID_RADIO = 1001;
 
+    private String curTitle = "Radio activa";
+    private String curText = "Escuchando…";
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
 
@@ -59,6 +61,20 @@ public class RadioService extends Service {
         return PendingIntent.getActivity(ctx, 0, open, flags);
     }
 
+    /** Al deslizar la notificación de "Radio activa" se pide volver a mostrarla. */
+    static PendingIntent repostIntent(Context ctx) {
+        Intent i = new Intent(ctx, RadioService.class);
+        i.setAction("app.walkieclaves.radio.REPOST");
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            return PendingIntent.getForegroundService(ctx, 1, i, flags);
+        }
+        return PendingIntent.getService(ctx, 1, i, flags);
+    }
+
     /** Notificación de alerta (clave urgente) con sonido y vibración. */
     static void postAlert(Context ctx, String title, String text, boolean urgent) {
         ensureChannels(ctx);
@@ -86,18 +102,20 @@ public class RadioService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         ensureChannels(this);
 
-        String title = "Radio activa";
-        String text = "Escuchando…";
+        // Si el usuario desliza la notificación (Android 14 lo permite), se vuelve a mostrar
+        // con los mismos textos.
         if (intent != null) {
             String t = intent.getStringExtra("title");
             String x = intent.getStringExtra("text");
             if (t != null && !t.isEmpty()) {
-                title = t;
+                curTitle = t;
             }
             if (x != null && !x.isEmpty()) {
-                text = x;
+                curText = x;
             }
         }
+        String title = curTitle;
+        String text = curText;
 
         Notification n = new NotificationCompat.Builder(this, CH_RADIO)
             .setSmallIcon(R.drawable.ic_stat_radio)
@@ -107,7 +125,9 @@ public class RadioService extends Service {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setContentIntent(openAppIntent(this))
+            .setDeleteIntent(repostIntent(this))
             .build();
+        n.flags |= Notification.FLAG_ONGOING_EVENT | Notification.FLAG_NO_CLEAR;
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(ID_RADIO, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);

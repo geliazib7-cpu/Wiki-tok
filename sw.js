@@ -1,6 +1,6 @@
 // Service worker: guarda la app para que abra rápido y se pueda instalar.
 // La voz y los mensajes siempre van por internet (no se cachean).
-const CACHE = "walkie-claves-v4";
+const CACHE = "walkie-claves-v5";
 const FILES = [
   "./",
   "./index.html",
